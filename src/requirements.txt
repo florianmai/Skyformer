@@ -3,7 +3,7 @@ transformers==4.5.0
 performer-pytorch
 tensorboard
 axial_positional_embedding
-local-attention
+local-attention==1.4.3
 fsspec
 wrapt
 opt_einsum

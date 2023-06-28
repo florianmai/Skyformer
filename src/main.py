@@ -21,7 +21,10 @@ from models.dataset_LRA import LRADataset
 
 
 
-
+def force_cudnn_initialization():
+    s = 32
+    dev = torch.device('cuda')
+    torch.nn.functional.conv2d(torch.zeros(s, s, s, s, device=dev), torch.zeros(s, s, s, s, device=dev))
 
 def print_summary(summary, save_if_improved, model, checkpoint_path):
     summary["loss"] = np.mean(summary["loss"])
@@ -200,6 +203,8 @@ def get_args():
 
 def main():
     args = get_args()
+
+    #force_cudnn_initialization()
 
     if args.task == 'lra-pathfinder':
         args.task = 'lra-pathfinder32-curv_contour_length_14'

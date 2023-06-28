@@ -35,7 +35,17 @@ def attn_selector(attn_type, config, W_q=None, W_k=None, W_v=None):
     elif attn_type.startswith("skyformer"):
         from models.attention_skyformer import Skyformer
         attn = Skyformer(config)
-
+    elif attn_type.startswith("hypermixing"):
+        from models.hypermixing import HyperMixing
+        attn = HyperMixing(config)
+    elif attn_type.startswith("hyperconformer"):
+        from models.hypermixing import HyperConformer, HyperMixing
+        global_mixing = HyperMixing(config)
+        attn = HyperConformer(config, global_mixing=global_mixing)
+    elif attn_type.startswith("conformer"):
+        from models.hypermixing import HyperConformer
+        global_mixing = SoftmaxAttentionWithSplit(config)
+        attn = HyperConformer(config, global_mixing=global_mixing)
     return attn
 
 
@@ -71,6 +81,62 @@ class SoftmaxAttention_RBF(nn.Module):
         # output [batch_size, nb_heads, seq_len, dim_head]
         return X
 
+class SoftmaxAttentionWithSplit(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.drop_attn = torch.nn.Dropout(p = config["attention_dropout"])
+        self.head_dim = config["head_dim"]
+        self.dim = config["transformer_dim"]
+        self.num_head = config["num_head"]
+
+        self.W_q = nn.Linear(self.dim, self.num_head * self.head_dim)
+        self.W_k = nn.Linear(self.dim, self.num_head * self.head_dim)
+        self.W_v = nn.Linear(self.dim, self.num_head * self.head_dim)
+
+        self.ff = nn.Linear(self.num_head * self.head_dim, self.dim)
+
+    def forward(self, Q, K, V, mask):
+
+        # split
+        Q = self.split_heads(self.W_q(Q))
+        K = self.split_heads(self.W_k(K))
+        V = self.split_heads(self.W_v(V))
+
+        with torch.cuda.amp.autocast(enabled = False):
+            X = checkpoint(self.attn, Q.float(), K.float(), V.float(), mask.float())
+
+        # recombine heads
+        X = X.transpose(1, 2)
+        X = X.reshape(X.size(0), X.size(1), self.num_head * self.head_dim)
+
+        # FF
+        out = self.ff(X)
+
+        # output [batch_size, nb_heads, seq_len, dim_head]
+
+        return out
+
+
+    def attn(self, Q, K, V, mask):
+        # input [batch_size, nb_heads, seq_len, dim_head]
+        # print('Q', Q.abs().median()) # check scale
+        # print('K', K.abs().median())
+        dot = torch.matmul(Q, torch.transpose(K, -2, -1))
+        dot = dot / math.sqrt(self.head_dim)
+        
+        dot = dot - 1e6 * (mask[:, None, None, :].float())
+
+        attn = nn.functional.softmax(dot, dim = -1)
+        attn = self.drop_attn(attn)
+
+        X = torch.matmul(attn, V)
+
+        return X
+
+    def split_heads(self, X):
+        X = X.reshape(X.size(0), X.size(1), self.num_head, self.head_dim)
+        X = X.transpose(1, 2)
+        return X
 
 class SoftmaxAttention(nn.Module):
     def __init__(self, config):
@@ -94,7 +160,6 @@ class SoftmaxAttention(nn.Module):
         # output [batch_size, nb_heads, seq_len, dim_head]
         return X
 
-
 class Attention(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -106,21 +171,34 @@ class Attention(nn.Module):
 
         self.attn_type = config["attn_type"]
 
-        self.W_q = nn.Linear(self.dim, self.num_head * self.head_dim)
-        self.W_k = nn.Linear(self.dim, self.num_head * self.head_dim)
-        self.W_v = nn.Linear(self.dim, self.num_head * self.head_dim)
+        if self.attn_type not in ["hypermixing", "hyperconformer", "conformer"]:
+            self.W_q = nn.Linear(self.dim, self.num_head * self.head_dim)
+            self.W_k = nn.Linear(self.dim, self.num_head * self.head_dim)
+            self.W_v = nn.Linear(self.dim, self.num_head * self.head_dim)
+        else:
+            self.W_q = None
+            self.W_k = None
+            self.W_v = None
+
 
         self.attn = attn_selector(self.attn_type, config, self.W_q, self.W_k, self.W_v)
 
         self.grad_checkpointing = (self.attn_type == "softmax")
 
-        self.ff = nn.Linear(self.num_head * self.head_dim, self.dim)
+        if self.attn_type not in ["hypermixing", "hyperconformer", "conformer"]:
+            self.ff = nn.Linear(self.num_head * self.head_dim, self.dim)
 
     def forward(self, X, mask):
 
         if self.attn_type.startswith("longformer") or self.attn_type.startswith("reformer"):
             with torch.cuda.amp.autocast(enabled = False):
-                attn_out = self.attn(X.float(), mask.float())
+                mask = mask.float()
+                attn_out = self.attn(X.float(), mask)
+        elif self.attn_type in ["hypermixing", "hyperconformer", "conformer"]:
+            with torch.cuda.amp.autocast(enabled = False):
+                mask = ~mask.bool()
+                X = X.float()
+                attn_out = self.attn(X, X, X, mask)
         else:
             Q = self.split_heads(self.W_q(X))
             K = self.split_heads(self.W_k(X))
@@ -131,7 +209,11 @@ class Attention(nn.Module):
                 else:
                     attn_out = self.attn(Q.float(), K.float(), V.float(), mask.float())
             attn_out = self.combine_heads(attn_out)
-        out = self.ff(attn_out)
+
+        if self.attn_type not in ["hypermixing", "hyperconformer", "conformer"]:
+            out = self.ff(attn_out)
+        else:
+            out = attn_out
 
         return out
 
